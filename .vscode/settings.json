@@ -36,5 +36,6 @@
     "titleBar.inactiveForeground": "#e7e7e799"
   },
   "peacock.color": "#007fff",
-  "idf.flashType": "UART"
+  "idf.flashType": "UART",
+  "idf.monitorPort": "COM3"
 }
