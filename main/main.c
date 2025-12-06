@@ -1,8 +1,9 @@
 #include <stdio.h>
 #include <string.h>
-
+#include <time.h>
+#include "dht.h"
 #include "driver/gpio.h"
-
+#include "esp_crt_bundle.h"
 #include "esp_event.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
@@ -10,14 +11,11 @@
 #include "esp_netif.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
-
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
-
+#include "mqtt_client.h"
 #include "nvs_flash.h"
-
-#include <time.h>
 
 #define WIFI_STA_SSID   ""
 #define WIFI_STA_PASS   ""
@@ -31,23 +29,32 @@
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
-#define SENSOR_TYPE DHT_TYPE_AM2301
-#define SENSOR_GPIO 33
-#define LED_CONFIG_GPIO 14
-#define LED_TEMPERATURA_GPIO 27
-#define LED_UMIDADE_GPIO 26
-#define LED_ERRO_GPIO 25
-#define BOTAO_RESET_GPIO 32
+#define CONFIG_BROKER_URL     "mqtts://38046a81f3ca4a18aa3b57d26f8a9887.s1.eu.hivemq.cloud:8883"
+#define CONFIG_MQTT_USERNAME  "ESP32"
+#define CONFIG_MQTT_PASSWORD  "Senha1234"
+
+#define SENSOR_TYPE           DHT_TYPE_AM2301
+#define SENSOR_GPIO           33
+#define LED_CONFIG_GPIO       14
+#define LED_TEMPERATURA_GPIO  27
+#define LED_UMIDADE_GPIO      26
+#define LED_ERRO_GPIO         25
+#define BOTAO_RESET_GPIO      32
+
+static char device_mac_str[18];
+static char topic_umidade[64];
+static char topic_temperatura[64];
+static int s_retry_num = 0;
+static esp_mqtt_client_handle_t global_mqtt_client = NULL;
+static EventGroupHandle_t s_wifi_event_group;
+TaskHandle_t ap_blink_handle = NULL;
 
 static const char *TAG_AP   = "WiFi SoftAP";
 static const char *TAG_STA  = "WiFi Sta";
 static const char *TAG_HTTP = "Webserver";
-
-static int s_retry_num = 0;
-static EventGroupHandle_t s_wifi_event_group;
-TaskHandle_t ap_blink_handle = NULL;
-
-static const char wifi_config_html[] =
+static const char *TAG_MQTT = "MQTT";
+static char wifi_config_html[2048];
+static char wifi_config_html_template[] =
 "<!DOCTYPE html>"
 "<html lang='pt-br'>"
 "<head>"
@@ -58,15 +65,17 @@ static const char wifi_config_html[] =
 "    body { font-family: Arial; padding: 20px; background: #f0f0f0; }"
 "    .card { max-width: 400px; margin: auto; background: white; padding: 20px; border-radius: 10px; "
 "            box-shadow: 0 2px 6px rgba(0,0,0,0.2); }"
-"    input { width: 100%; padding: 12px; margin: 8px 0; border-radius: 5px; border: 1px solid #ccc; }"
+"    input { width: 100%; box-sizing: border-box; padding: 12px; margin: 8px 0; border-radius: 5px; border: 1px solid #ccc; }"
 "    button { width: 100%; padding: 12px; background: #007bff; color: white; border: none; border-radius: 5px;"
 "             font-size: 16px; cursor: pointer; }"
 "    button:hover { background: #0056b3; }"
+"    .mac-box { background:#e9ecef; padding:10px; border-radius:5px; margin-bottom:15px; font-size:14px; }"
 "  </style>"
 "</head>"
 "<body>"
 "  <div class='card'>"
 "    <h2>Configurar WiFi</h2>"
+"    <div class='mac-box'>Endereço MAC do dispositivo:<br><b>%s</b></div>"
 "    <form action='/wifi' method='POST'>"
 "      <label>SSID</label>"
 "      <input type='text' name='ssid' placeholder='Nome da Rede' required>"
@@ -112,6 +121,19 @@ void blink_led(int LED_GPIO)
     gpio_set_level(LED_GPIO, 1);
     vTaskDelay(pdMS_TO_TICKS(300));
     gpio_set_level(LED_GPIO, 0);
+}
+
+esp_err_t get_esp_mac_address(char *mac_addr_str)
+{
+    uint8_t mac[6] = {0};
+    esp_err_t err = esp_wifi_get_mac(ESP_IF_WIFI_STA, mac);
+
+    if(err == ESP_OK) {
+        sprintf(mac_addr_str, "%02X:%02X:%02X:%02X:%02X:%02X", 
+            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    }
+
+    return err;
 }
 
 // -----------------------------------------------------------------------------------------------------------
@@ -163,8 +185,13 @@ esp_netif_t *wifi_init_sta(const char *ssid, const char *password)
 }
 
 // -----------------------------------------------------------------------------------------------------------
-// WEBSERVER - HANDLER POST /wifi
+// WEBSERVER - HANDLER
 // -----------------------------------------------------------------------------------------------------------
+
+void prepare_wifi_page(const char *mac)
+{
+  snprintf(wifi_config_html, sizeof(wifi_config_html), wifi_config_html_template, mac);
+}
 
 esp_err_t wifi_get_handler(httpd_req_t *req)
 {
@@ -254,6 +281,7 @@ httpd_handle_t start_webserver(void)
   return NULL;
 }
 
+
 // -----------------------------------------------------------------------------------------------------------
 // CONFIGURAÇÕES NO NVS
 // -----------------------------------------------------------------------------------------------------------
@@ -316,7 +344,39 @@ void ap_blink_task(void *arg)
   }
 }
 
+void dht_task(void *pvParameters)
+{
+  float temperatura;
+  float umidade;
 
+  float last_temperatura = -1;
+  float last_umidade = -1;
+
+  while(1) {
+    if (dht_read_float_data(SENSOR_TYPE, SENSOR_GPIO, &umidade, &temperatura) == ESP_OK) {
+      if(umidade != last_umidade && global_mqtt_client != NULL) {
+        last_umidade = umidade;
+        char msg[16];
+        sprintf(msg, "%.1f", umidade);
+        esp_mqtt_client_publish(global_mqtt_client, topic_umidade, msg, 0, 1, 0);
+        blink_led(LED_UMIDADE_GPIO);
+      }
+      if(temperatura != last_temperatura && global_mqtt_client != NULL) {
+        last_temperatura = temperatura;
+        char msg[16];
+        sprintf(msg, "%.1f", temperatura);
+        esp_mqtt_client_publish(global_mqtt_client, topic_temperatura, msg, 0, 1, 0);
+        blink_led(LED_TEMPERATURA_GPIO);
+      }
+      ESP_LOGI(TAG_MQTT, "Umidade: %.1f%%, Temperatura: %.1fºC", umidade, temperatura);
+    } else {
+      ESP_LOGE(TAG_MQTT, "Falha ao ler os dados do DHT22");
+      blink_led(LED_ERRO_GPIO);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(3000));
+  }
+}
 
 void sta_monitor_task(void *arg)
 {
@@ -339,6 +399,7 @@ void sta_monitor_task(void *arg)
     esp_wifi_set_mode(WIFI_MODE_AP);
     wifi_init_softap();
     esp_wifi_start();
+    prepare_wifi_page(device_mac_str);
     start_webserver();
     xTaskCreate(ap_blink_task, "ap_blink_task", 2048, NULL, 5, NULL);
   }
@@ -347,7 +408,74 @@ void sta_monitor_task(void *arg)
 }
 
 // -----------------------------------------------------------------------------------------------------------
-// EVENTS HANDLER
+// MQTT EVENTS HANDLER
+// -----------------------------------------------------------------------------------------------------------
+
+static void log_error_if_nonzero(const char *message, int error_code)
+{
+    if (error_code != 0) {
+        ESP_LOGE(TAG_MQTT, "Last error %s: 0x%x", message, error_code);
+    }
+}
+
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
+{
+  ESP_LOGD(TAG_MQTT, "Event dispatched from event loop base=%s, event_id=%" PRIi32 "", base, event_id);
+  esp_mqtt_event_handle_t event = event_data;
+  esp_mqtt_client_handle_t client = event->client;
+  int msg_id;
+  switch ((esp_mqtt_event_id_t)event_id) {
+  case MQTT_EVENT_CONNECTED:
+    ESP_LOGI(TAG_MQTT, "MQTT_EVENT_CONNECTED");
+    break;
+  case MQTT_EVENT_DISCONNECTED:
+    ESP_LOGI(TAG_MQTT, "MQTT_EVENT_DISCONNECTED");
+    break;
+
+  case MQTT_EVENT_SUBSCRIBED:
+    break;
+  case MQTT_EVENT_UNSUBSCRIBED:
+    break;
+  case MQTT_EVENT_PUBLISHED:
+    break;
+  case MQTT_EVENT_DATA:
+    break;
+
+  case MQTT_EVENT_ERROR:
+    ESP_LOGI(TAG_MQTT, "MQTT_EVENT_ERROR");
+    if (event->error_handle->error_type == MQTT_ERROR_TYPE_TCP_TRANSPORT) {
+      log_error_if_nonzero("reported from esp-tls", event->error_handle->esp_tls_last_esp_err);
+      log_error_if_nonzero("reported from tls stack", event->error_handle->esp_tls_stack_err);
+      log_error_if_nonzero("captured as transport's socket errno",  event->error_handle->esp_transport_sock_errno);
+      ESP_LOGI(TAG_MQTT, "Last errno string (%s)", strerror(event->error_handle->esp_transport_sock_errno));
+    }
+    break;
+  default:
+    ESP_LOGI(TAG_MQTT, "Other event id:%d", event->event_id);
+    break;
+  }
+}
+
+// -----------------------------------------------------------------------------------------------------------
+// INICIALIZAÇÃO DO MQTT
+// -----------------------------------------------------------------------------------------------------------
+
+static void mqtt_app_start(void)
+{
+  esp_mqtt_client_config_t mqtt_cfg = {
+    .broker.address.uri = CONFIG_BROKER_URL,
+    .broker.verification.crt_bundle_attach = esp_crt_bundle_attach,
+    .credentials.username = CONFIG_MQTT_USERNAME,
+    .credentials.authentication.password = CONFIG_MQTT_PASSWORD,
+    .session.protocol_ver = MQTT_PROTOCOL_V_3_1_1,
+  };
+  global_mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+  esp_mqtt_client_register_event(global_mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+  esp_mqtt_client_start(global_mqtt_client);
+}
+
+// -----------------------------------------------------------------------------------------------------------
+// WIFI_EVENTS HANDLER
 // -----------------------------------------------------------------------------------------------------------
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
@@ -376,6 +504,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     s_retry_num = 0;  
     xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     gpio_set_level(LED_CONFIG_GPIO, 0);
+    mqtt_app_start();
   }
 }
 
@@ -423,6 +552,17 @@ void app_main(void)
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
   ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
+    
+  if(get_esp_mac_address(device_mac_str) == ESP_OK) {
+    ESP_LOGI(TAG_MQTT, "MAC Address obtido: %s", device_mac_str);
+  } else {
+    strcpy(device_mac_str, "UNKNOWN_DEVICE_ID");
+    ESP_LOGE(TAG_MQTT, "Falha ao obter o MAC Address. Usando ID padrão");
+  }
+
+  sprintf(topic_umidade, "%s/umidade", device_mac_str);
+  sprintf(topic_temperatura, "%s/temperatura", device_mac_str);
+
   if (strlen(ssid) > 0 && strlen(password) > 0) {
     ESP_LOGI(TAG_STA, "Iniciando STA com dados do NVS...");
     esp_wifi_set_mode(WIFI_MODE_STA);
@@ -430,11 +570,13 @@ void app_main(void)
     esp_wifi_start();
     xTaskCreate(wifi_reset_task, "wifi_reset_task", 2048, NULL, 5, NULL);
     xTaskCreate(sta_monitor_task, "sta_monitor_task", 4096, NULL, 5, NULL);
+    xTaskCreate(dht_task, "dht_task", 4096, NULL, 5, NULL);
   } else {
     ESP_LOGI(TAG_AP, "Iniciando Access Point...");
     esp_wifi_set_mode(WIFI_MODE_AP);
     wifi_init_softap();
     esp_wifi_start();
+    prepare_wifi_page(device_mac_str);
     start_webserver();
     xTaskCreate(ap_blink_task, "ap_blink_task", 2048, NULL, 5, NULL);
   }
